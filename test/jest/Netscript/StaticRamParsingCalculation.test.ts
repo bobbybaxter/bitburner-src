@@ -148,13 +148,26 @@ describe("Parsing NetScript code to work out static RAM costs", function () {
       expectCost(calculated, 0);
     });
 
-    // TODO: once we fix static parsing this should pass
-    it.skip("Function 'getTask' that can be confused with Sleeve.getTask", function () {
+    it("Function 'getTask' that can be confused with Sleeve.getTask", function () {
       const code = `
         export async function main(ns) {
           getTask();
         }
         function getTask() { return 0; }
+      `;
+      const calculated = calculateRamUsage(code, filename, server, new Map()).cost;
+      expectCost(calculated, 0);
+    });
+
+    it("Parameter named 'attempt' does not pick up codingcontract.attempt RAM", function () {
+      const code = `
+        /** @param {NS} ns */
+        export async function main(ns) {
+          function f(attempt) {
+            return attempt + 1;
+          }
+          f(0);
+        }
       `;
       const calculated = calculateRamUsage(code, filename, server, new Map()).cost;
       expectCost(calculated, 0);

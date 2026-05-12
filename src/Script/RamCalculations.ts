@@ -72,6 +72,91 @@ function getNumericCost(cost: number | (() => number)): number {
   return typeof cost === "function" ? cost() : cost;
 }
 
+function unwrapExpressionForMemberPath(node: acorn.Expression | acorn.Super): acorn.Expression | acorn.Super {
+  let n: acorn.Node = node as acorn.Node;
+  for (;;) {
+    if (n.type === "ParenthesizedExpression") {
+      n = (n as acorn.ParenthesizedExpression).expression as acorn.Node;
+      continue;
+    }
+    if (n.type === "ChainExpression") {
+      n = (n as acorn.ChainExpression).expression as acorn.Node;
+      continue;
+    }
+    return n as acorn.Expression | acorn.Super;
+  }
+}
+
+/**
+ * Collects a.b.c from a non-computed member chain whose root is a simple Identifier.
+ * Returns null for dynamic roots (e.g. call results) or computed access.
+ */
+function collectStaticMemberExpressionPath(node: acorn.MemberExpression): string[] | null {
+  const parts: string[] = [];
+  let current: acorn.MemberExpression = node;
+  for (;;) {
+    if (current.computed) {
+      return null;
+    }
+    const prop = current.property;
+    if (prop.type !== "Identifier") {
+      return null;
+    }
+    parts.unshift(prop.name);
+    const obj = unwrapExpressionForMemberPath(current.object as acorn.Expression);
+    if (obj.type === "Identifier") {
+      parts.unshift(obj.name);
+      return parts;
+    }
+    if (obj.type === "MemberExpression") {
+      current = obj;
+      continue;
+    }
+    return null;
+  }
+}
+
+/** Maps a static access path to RamCosts keys (RamCosts has no top-level `ns` wrapper). */
+function ramCostRefFromStaticPath(path: string[]): string {
+  const segments = path[0] === "ns" ? path.slice(1) : path;
+  return segments.join(".");
+}
+
+/**
+ * Resolves a dependency string against RamCosts. Dotted refs use strict path traversal; bare refs
+ * only match top-level leaves so locals (e.g. `attempt`) do not pick up nested API keys (`codingcontract.attempt`).
+ */
+function lookupRamCost(ref: string): { func: (() => number) | number; refDetail: string } | undefined {
+  if (!ref) {
+    return undefined;
+  }
+  const costs = RamCosts as Record<string, unknown>;
+  if (ref.includes(".")) {
+    const segments = ref.split(".");
+    let cur: unknown = costs;
+    for (let i = 0; i < segments.length; i++) {
+      const seg = segments[i];
+      if (seg === undefined || cur === null || typeof cur !== "object") {
+        return undefined;
+      }
+      const next = (cur as Record<string, unknown>)[seg];
+      if (i === segments.length - 1) {
+        if (typeof next === "number" || typeof next === "function") {
+          return { func: next as (() => number) | number, refDetail: ref };
+        }
+        return undefined;
+      }
+      cur = next;
+    }
+    return undefined;
+  }
+  const leaf = costs[ref];
+  if (typeof leaf === "number" || typeof leaf === "function") {
+    return { func: leaf as (() => number) | number, refDetail: ref };
+  }
+  return undefined;
+}
+
 /**
  * Parses code into an AST and walks through it recursively to calculate
  * RAM usage. Also accounts for imported modules.
@@ -221,29 +306,7 @@ function parseOnlyRamCalculate(
       }
       loadedFns[ref] = true;
 
-      // This accounts for namespaces (Bladeburner, CodingContract, etc.)
-      const findFunc = (
-        prefix: string,
-        obj: object,
-        ref: string,
-      ): { func: (() => number) | number; refDetail: string } | undefined => {
-        if (!obj) {
-          return;
-        }
-        const elem = Object.entries(obj).find(([key]) => key === ref);
-        if (elem !== undefined && (typeof elem[1] === "function" || typeof elem[1] === "number")) {
-          return { func: elem[1] as (() => number) | number, refDetail: `${prefix}${ref}` };
-        }
-        for (const [key, value] of Object.entries(obj)) {
-          const found = findFunc(`${key}.`, value as object, ref);
-          if (found) {
-            return found;
-          }
-        }
-        return undefined;
-      };
-
-      const details = findFunc("", RamCosts, ref);
+      const details = lookupRamCost(ref);
       const fnRam = getNumericCost(details?.func ?? 0);
       ram += fnRam;
       detailedCosts.push({ type: "fn", name: details?.refDetail ?? "", cost: fnRam });
@@ -434,6 +497,10 @@ function parseOnlyCalculateDeps(
         node.alternate && walkDeeper(node.alternate, st);
       },
       MemberExpression: (node: acorn.MemberExpression, st: State, walkDeeper: walk.WalkerCallback<State>) => {
+        const path = collectStaticMemberExpressionPath(node);
+        if (path !== null && path.length >= 2) {
+          addRef(st.key, ramCostRefFromStaticPath(path));
+        }
         node.object && walkDeeper(node.object, st);
         node.property && walkDeeper(node.property, st);
       },
